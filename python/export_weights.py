@@ -37,13 +37,15 @@ MASK_BUFFER = re.compile(r"h\.\d+\.attn\.bias$")
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="gpt2", help="gpt2 | gpt2-medium | gpt2-large | gpt2-xl")
     ap.add_argument("--int8", action="store_true", help="quantize the big linear weights to int8")
     args = ap.parse_args()
 
-    cfg = json.loads((WEIGHTS / "config.json").read_text())
-    tensors = load_file(str(WEIGHTS / "model.safetensors"))
+    src = WEIGHTS if args.model == "gpt2" else WEIGHTS / args.model
+    cfg = json.loads((src / "config.json").read_text())
+    tensors = load_file(str(src / "model.safetensors"))
     keep = {k: v for k, v in tensors.items() if not MASK_BUFFER.search(k)}
-    out_path = WEIGHTS / ("gpt2-int8.bin" if args.int8 else "gpt2.bin")
+    out_path = WEIGHTS / f"{args.model}{'-int8' if args.int8 else ''}.bin"
 
     n_quant = 0
     with open(out_path, "wb") as f:

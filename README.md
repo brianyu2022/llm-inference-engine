@@ -1,13 +1,16 @@
 # LLM Inference Engine
 
-> Working name — rename before you push to GitHub (ideas: `nanoserve`, `tinfer`, `ferrite`).
-
 A from-scratch LLM inference engine. Starts as a readable NumPy reference that runs
-**GPT-2** with no PyTorch, then becomes a fast C++ engine with a KV-cache,
-quantization, continuous batching, and (stretch) hand-written Metal/SIMD kernels.
+**GPT-2** with no PyTorch, then becomes a fast C++ engine with a KV-cache, int8
+quantization, continuous batching, and a hand-written int8 kernel that **beats
+Apple's Accelerate BLAS by 1.21×**.
 
 The point isn't "it generates text" — that's the easy part. The point is the
 **performance engineering**: making it fast and measuring it honestly.
+
+**📄 [Read the full writeup →](WRITEUP.md)** — the stage-by-stage story, the
+benchmarks, and what each optimization taught (prefill vs. decode, memory-bound
+kernels, AMX vs. NEON vs. integer SDOT, the batching throughput/latency tradeoff).
 
 ## Why this exists
 
@@ -81,6 +84,21 @@ weight-only, +4.0% for W8A8 (weights + activations).
 Throughput scales with batch size (the linear projections are batched across
 sequences); per-request latency rises — the classic serving tradeoff. Scaling is
 sublinear because attention is still per-sequence (what PagedAttention fixes).
+
+### Scaling to larger models
+
+The engine is config-driven — it runs any GPT-2 size with no code changes
+(`python python/download_weights.py gpt2-medium && python python/export_weights.py
+--model gpt2-medium --int8`). Verified on **GPT-2 medium (355M)**; fp32 and int8
+produce identical greedy output:
+
+| model | params | fp32 decode | int8 (W8A8) decode | int8 on disk |
+|---|---:|---:|---:|---:|
+| gpt2 | 124M | 243 tok/s | 302 tok/s | 243 MB |
+| gpt2-medium | 355M | 91 tok/s | 110 tok/s | 514 MB |
+
+The ~1.2× int8 speedup holds across sizes; larger models are more
+bandwidth-bound, so quantization matters more as you scale.
 
 ### Running the C++ engine
 
