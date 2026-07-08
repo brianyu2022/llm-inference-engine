@@ -1,6 +1,6 @@
 // Loader for the flat GPT-2 weight format written by python/export_weights.py.
-// Deliberately tiny: read the header, then read each tensor's floats straight
-// into a vector. No JSON, no dependencies.
+// Format v2 adds a per-tensor dtype so weights can be fp32 or int8. v1 files
+// (no dtype field, all fp32) still load.
 #pragma once
 
 #include <cstdint>
@@ -11,17 +11,19 @@
 #include <vector>
 
 struct Tensor {
-    std::vector<int> shape;
-    std::vector<float> data;
+    std::vector<int> shape;        // logical shape (K, N) for weight matrices
+    int dtype = 0;                 // 0 = fp32, 1 = int8 (per-column, stored transposed (N, K))
+    std::vector<float> data;       // fp32 values         (dtype 0)
+    std::vector<int8_t> qdata;     // int8 values, (N, K) (dtype 1)
+    std::vector<float> scale;      // per-column scales, length N (dtype 1)
 
     size_t numel() const {
         size_t n = 1;
         for (int d : shape) n *= static_cast<size_t>(d);
         return n;
     }
-    // Convenience for 2-D weight matrices.
-    int rows() const { return shape.at(0); }
-    int cols() const { return shape.at(1); }
+    int rows() const { return shape.at(0); }  // K (input dim)
+    int cols() const { return shape.at(1); }  // N (output dim)
 };
 
 struct Config {
@@ -56,7 +58,7 @@ inline Model load_model(const std::string& path) {
     if (std::string(magic, 4) != "GPT2") throw std::runtime_error("bad magic in " + path);
 
     Model m;
-    (void)read_pod<int32_t>(f);  // version
+    int version = read_pod<int32_t>(f);
     m.cfg.n_layer    = read_pod<int32_t>(f);
     m.cfg.n_head     = read_pod<int32_t>(f);
     m.cfg.n_embd     = read_pod<int32_t>(f);
@@ -69,14 +71,26 @@ inline Model load_model(const std::string& path) {
         std::string name(name_len, '\0');
         f.read(name.data(), name_len);
 
-        int ndim = read_pod<int32_t>(f);
         Tensor t;
+        t.dtype = (version >= 2) ? read_pod<int32_t>(f) : 0;
+
+        int ndim = read_pod<int32_t>(f);
         t.shape.resize(ndim);
         for (int d = 0; d < ndim; ++d) t.shape[d] = read_pod<int32_t>(f);
 
-        t.data.resize(t.numel());
-        f.read(reinterpret_cast<char*>(t.data.data()),
-               static_cast<std::streamsize>(t.numel() * sizeof(float)));
+        if (t.dtype == 0) {
+            t.data.resize(t.numel());
+            f.read(reinterpret_cast<char*>(t.data.data()),
+                   static_cast<std::streamsize>(t.numel() * sizeof(float)));
+        } else {  // int8: N*K int8 values (transposed) followed by N fp32 scales
+            int K = t.rows(), N = t.cols();
+            t.qdata.resize(static_cast<size_t>(N) * K);
+            f.read(reinterpret_cast<char*>(t.qdata.data()),
+                   static_cast<std::streamsize>(t.qdata.size()));
+            t.scale.resize(N);
+            f.read(reinterpret_cast<char*>(t.scale.data()),
+                   static_cast<std::streamsize>(N * sizeof(float)));
+        }
         if (!f) throw std::runtime_error("EOF while reading tensor " + name);
 
         m.tensors.emplace(std::move(name), std::move(t));

@@ -20,11 +20,31 @@ inline void gemm(const float* A, const float* B, float* C, int M, int N, int K,
 }
 
 // Y(T x N) = X(T x K) @ W(K x N) + bias(N). W is a GPT-2 Conv1D weight (in x out).
+// fp32 weights go through BLAS; int8 weights use a weight-only quantized kernel
+// that reads 1-byte weights and dequantizes on the fly (4x less memory traffic).
 inline void linear(const float* X, const Tensor& W, const Tensor& bias, int T,
                    std::vector<float>& Y) {
     int K = W.rows(), N = W.cols();
     Y.resize(static_cast<size_t>(T) * N);
-    gemm(X, W.data.data(), Y.data(), T, N, K, /*transB=*/false);
+
+    if (W.dtype == 0) {
+        gemm(X, W.data.data(), Y.data(), T, N, K, /*transB=*/false);
+    } else {
+        // int8: W is stored transposed (N x K); Y[t,n] = scale[n] * <X[t], q[n]>.
+        const int8_t* q = W.qdata.data();
+        const float* s = W.scale.data();
+        for (int t = 0; t < T; ++t) {
+            const float* xrow = X + static_cast<size_t>(t) * K;
+            float* yrow = Y.data() + static_cast<size_t>(t) * N;
+            for (int n = 0; n < N; ++n) {
+                const int8_t* wq = q + static_cast<size_t>(n) * K;
+                float acc = 0.0f;
+                for (int k = 0; k < K; ++k) acc += xrow[k] * static_cast<float>(wq[k]);
+                yrow[n] = acc * s[n];
+            }
+        }
+    }
+
     for (int t = 0; t < T; ++t)
         for (int j = 0; j < N; ++j) Y[static_cast<size_t>(t) * N + j] += bias.data[j];
 }
