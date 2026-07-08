@@ -27,25 +27,25 @@ attention. Every optimization is benchmarked against a baseline.
 - [x] **Stage 3 — KV-cache.** Prefill/decode split; cache each layer's K/V and
       attend against history instead of recomputing. **243 tok/s vs. 19 tok/s
       non-cached at 256 tokens (~13×)**, with flat per-token latency.
-- [~] **Stage 4 — int8 quantization.** Weights 4× smaller (whole model 498 → 243
-      MB on disk) at **+0.85% perplexity**, greedy output unchanged. BUT the
-      naive scalar kernel is **10× slower** than fp32 BLAS — it reads less data
-      but is single-threaded and unvectorized, so it wastes the bandwidth win
-      and the cores. Realizing the speedup needs a SIMD + multithreaded int8
-      kernel (Stage 6). *Great lesson: quantization only helps if the kernel
-      exploits it.*
+- [x] **Stage 4 — int8 quantization + custom kernel.** Weights 2× smaller on
+      disk (498 → 243 MB) at **+0.85% perplexity**, greedy output unchanged.
+      Custom int8 matmul with **NEON SIMD + GCD multithreading**: 184 tok/s —
+      **7× faster than the naive scalar kernel** (26 tok/s), ~0.78× of fp32 BLAS.
+      The remaining gap is Apple's **AMX matrix coprocessor** (used by Accelerate
+      for fp32 GEMM), which NEON can't match. *Lesson: quantization only helps if
+      the kernel exploits it, and you're competing against dedicated matrix HW.*
 - [ ] **Stage 5 — Continuous batching + serving API.** Metric: throughput and
       p50/p95 under concurrent load.
-- [ ] **Stage 6 — Custom SIMD/threaded kernels + roofline.** First target: make
-      the int8 kernel actually beat fp32.
+- [ ] **Stage 6 — W8A8 + SDOT integer kernel.** Quantize activations too and use
+      ARM's int8 dot-product instruction to beat fp32 BLAS. Plus roofline
+      analysis.
 
 ## Status
 
-**Stage 4 in progress.** fp32 C++ engine with a KV-cache does **243 tok/s**
-decode (vs. 19 non-cached, 10 NumPy), validated token-for-token. int8
-quantization is implemented and quality-validated (+0.85% perplexity, 2× smaller
-on disk) but the naive int8 kernel is bandwidth-underutilized and slower — next
-up is a SIMD + multithreaded int8 kernel to actually beat fp32.
+**Stages 1–4 done.** fp32 KV-cache engine: **243 tok/s** decode (validated
+token-for-token). int8 path: 2× smaller on disk, +0.85% perplexity, with a
+NEON+multithreaded kernel at 184 tok/s (7× over naive). Next: W8A8 + SDOT to
+beat fp32 BLAS (Stage 6), or the serving API (Stage 5).
 
 ### Benchmarks (GPT-2 124M, M4 Pro, greedy, 256 tokens)
 

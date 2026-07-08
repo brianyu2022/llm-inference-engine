@@ -4,6 +4,8 @@
 #pragma once
 
 #include <Accelerate/Accelerate.h>
+#include <arm_neon.h>       // NEON SIMD intrinsics (Apple Silicon)
+#include <dispatch/dispatch.h>  // Grand Central Dispatch (multithreading)
 
 #include <cmath>
 #include <string>
@@ -19,6 +21,47 @@ inline void gemm(const float* A, const float* B, float* C, int M, int N, int K,
                 M, N, K, alpha, A, K, B, transB ? K : N, beta, C, N);
 }
 
+// int8 weight-only matmul: Y(T x N) = X(T x K) @ W, where W is stored transposed
+// (N x K) int8 with a per-column scale. Each output column is an independent dot
+// product, so we (a) fan columns across cores with GCD and (b) vectorize the
+// dot product with NEON: load 16 int8 weights, widen to float, fused-multiply-add
+// against the activations. This turns the memory-bandwidth win of int8 into a
+// real speedup instead of throwing it away.
+inline void qmatmul_int8(const float* X, const Tensor& W, int T, float* Y) {
+    const int K = W.rows(), N = W.cols();
+    const int8_t* q = W.qdata.data();
+    const float* s = W.scale.data();
+    const int CHUNK = 32;  // columns per parallel task (amortizes dispatch overhead)
+    const size_t nchunks = (N + CHUNK - 1) / CHUNK;
+
+    dispatch_apply(nchunks, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(size_t c) {
+        int n0 = static_cast<int>(c) * CHUNK;
+        int n1 = (n0 + CHUNK < N) ? n0 + CHUNK : N;
+        for (int t = 0; t < T; ++t) {
+            const float* xrow = X + static_cast<size_t>(t) * K;
+            float* yrow = Y + static_cast<size_t>(t) * N;
+            for (int n = n0; n < n1; ++n) {
+                const int8_t* wq = q + static_cast<size_t>(n) * K;
+                float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0),
+                            a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+                int k = 0;
+                for (; k + 16 <= K; k += 16) {
+                    int8x16_t w8 = vld1q_s8(wq + k);
+                    int16x8_t wlo = vmovl_s8(vget_low_s8(w8));
+                    int16x8_t whi = vmovl_s8(vget_high_s8(w8));
+                    a0 = vfmaq_f32(a0, vld1q_f32(xrow + k),      vcvtq_f32_s32(vmovl_s16(vget_low_s16(wlo))));
+                    a1 = vfmaq_f32(a1, vld1q_f32(xrow + k + 4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(wlo))));
+                    a2 = vfmaq_f32(a2, vld1q_f32(xrow + k + 8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(whi))));
+                    a3 = vfmaq_f32(a3, vld1q_f32(xrow + k + 12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(whi))));
+                }
+                float acc = vaddvq_f32(a0) + vaddvq_f32(a1) + vaddvq_f32(a2) + vaddvq_f32(a3);
+                for (; k < K; ++k) acc += xrow[k] * static_cast<float>(wq[k]);  // tail
+                yrow[n] = acc * s[n];
+            }
+        }
+    });
+}
+
 // Y(T x N) = X(T x K) @ W(K x N) + bias(N). W is a GPT-2 Conv1D weight (in x out).
 // fp32 weights go through BLAS; int8 weights use a weight-only quantized kernel
 // that reads 1-byte weights and dequantizes on the fly (4x less memory traffic).
@@ -30,19 +73,7 @@ inline void linear(const float* X, const Tensor& W, const Tensor& bias, int T,
     if (W.dtype == 0) {
         gemm(X, W.data.data(), Y.data(), T, N, K, /*transB=*/false);
     } else {
-        // int8: W is stored transposed (N x K); Y[t,n] = scale[n] * <X[t], q[n]>.
-        const int8_t* q = W.qdata.data();
-        const float* s = W.scale.data();
-        for (int t = 0; t < T; ++t) {
-            const float* xrow = X + static_cast<size_t>(t) * K;
-            float* yrow = Y.data() + static_cast<size_t>(t) * N;
-            for (int n = 0; n < N; ++n) {
-                const int8_t* wq = q + static_cast<size_t>(n) * K;
-                float acc = 0.0f;
-                for (int k = 0; k < K; ++k) acc += xrow[k] * static_cast<float>(wq[k]);
-                yrow[n] = acc * s[n];
-            }
-        }
+        qmatmul_int8(X, W, T, Y.data());
     }
 
     for (int t = 0; t < T; ++t)
