@@ -11,7 +11,7 @@ LDFLAGS  := -framework Accelerate
 BUILD    := build
 
 .PHONY: all clean
-all: $(BUILD)/inspect $(BUILD)/generate $(BUILD)/generate_kv
+all: $(BUILD)/inspect $(BUILD)/generate $(BUILD)/generate_kv $(BUILD)/serve
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -24,6 +24,9 @@ $(BUILD)/generate: generate.cpp forward.h weights.h | $(BUILD)
 
 $(BUILD)/generate_kv: generate_kv.cpp forward_kv.h forward.h weights.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) generate_kv.cpp -o $@ $(LDFLAGS)
+
+$(BUILD)/serve: serve.cpp batch.h forward_kv.h forward.h weights.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) serve.cpp -o $@ $(LDFLAGS)
 
 clean:
 	rm -rf $(BUILD)

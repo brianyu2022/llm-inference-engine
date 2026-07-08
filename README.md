@@ -34,8 +34,10 @@ attention. Every optimization is benchmarked against a baseline.
       The remaining gap is Apple's **AMX matrix coprocessor** (used by Accelerate
       for fp32 GEMM), which NEON can't match. *Lesson: quantization only helps if
       the kernel exploits it, and you're competing against dedicated matrix HW.*
-- [ ] **Stage 5 — Continuous batching + serving API.** Metric: throughput and
-      p50/p95 under concurrent load.
+- [x] **Stage 5 — Continuous batching.** Decode B sequences per step — batching
+      the linear projections while attending per-sequence — and admit/prefill
+      waiting requests as slots free. Aggregate throughput scales **272 → 511
+      tok/s (1.88×) from batch 1 → 16**, with the expected latency tradeoff.
 - [x] **Stage 6 — W8A8 + SDOT integer kernel.** Dynamic per-row int8 activations
       + ARM `SDOT` (int8·int8 → int32). **~302 tok/s — 1.21× faster than fp32
       BLAS**, beating Apple's AMX path, at +4.0% perplexity. *The full arc:
@@ -43,10 +45,11 @@ attention. Every optimization is benchmarked against a baseline.
 
 ## Status
 
-**Stages 1–4 + 6 done.** The custom **W8A8 + SDOT int8 kernel does ~302 tok/s —
-1.21× faster than Apple's fp32 BLAS** — at a 2× smaller model and +4.0%
-perplexity, greedy output unchanged. Full engine validated token-for-token
-against the NumPy reference. Remaining: Stage 5 (serving API), roofline analysis.
+**All core stages (1–6) done.** From-scratch GPT-2: NumPy reference → C++ engine
+→ KV-cache (243 tok/s) → int8 quantization → **custom W8A8 + SDOT kernel that
+beats Apple's fp32 BLAS by 1.21×** → **continuous batching** (1.88× throughput at
+batch 16). Everything validated token-for-token against the reference. Polish
+remaining: roofline analysis, bigger models, a writeup.
 
 ### Benchmarks (GPT-2 124M, M4 Pro, greedy, 256 tokens)
 
@@ -61,6 +64,19 @@ against the NumPy reference. Remaining: Stage 5 (serving API), roofline analysis
 
 int8 model is 243 MB on disk (vs 498 MB fp32). Quality cost: +0.85% perplexity
 weight-only, +4.0% for W8A8 (weights + activations).
+
+### Continuous batching (GPT-2 124M int8, 32 requests × 64 tokens)
+
+| max batch | aggregate tok/s | speedup | p50 latency | p95 latency |
+|---:|---:|---:|---:|---:|
+| 1 | 272 | 1.00× | 234 ms | 236 ms |
+| 4 | 353 | 1.30× | 699 ms | 723 ms |
+| 8 | 437 | 1.61× | 1114 ms | 1167 ms |
+| 16 | 511 | 1.88× | 1862 ms | 1979 ms |
+
+Throughput scales with batch size (the linear projections are batched across
+sequences); per-request latency rises — the classic serving tradeoff. Scaling is
+sublinear because attention is still per-sequence (what PagedAttention fixes).
 
 ### Running the C++ engine
 
