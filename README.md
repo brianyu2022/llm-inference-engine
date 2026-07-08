@@ -49,6 +49,12 @@ attention. Every optimization is benchmarked against a baseline.
       fp32 hits 44% of the M4 Pro's ~273 GB/s peak, int8 26%. The fp32 logits
       projection (`wte`, 154 MB/token) dominates int8 traffic → quantizing the
       embedding table is the next win. (`python/roofline.py`)
+- [x] **Quantized `wte`** (the roofline's predicted next win). Per-row int8,
+      weight-only for the argmax-sensitive logits (`export_weights.py --int8
+      --quant-wte`). Nearly **halves the model, 232 → 121 MB**, at **+0.01%
+      perplexity**; decode +~5% — modest, because (same as the linears) the int8
+      logits kernel uses NEON, not the AMX that fp32 BLAS taps. The roofline
+      pointed the right way; the win landed mostly as size.
 
 ## Status
 

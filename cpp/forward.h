@@ -218,6 +218,59 @@ inline void mlp(const float* x_ln, const Model& m, int layer, int T, std::vector
     linear(h1.data(), m.get(p + ".mlp.c_proj.weight"), m.get(p + ".mlp.c_proj.bias"), T, out);
 }
 
+// Embedding lookup for one token at `pos`, written into dst (length C). Handles
+// an fp32 or int8 (per-row) tied embedding table.
+inline void embed_token(const Tensor& wte, const Tensor& wpe, int id, int pos, int C, float* dst) {
+    const float* pe = wpe.data.data() + static_cast<size_t>(pos) * C;
+    if (wte.dtype == 0) {
+        const float* te = wte.data.data() + static_cast<size_t>(id) * C;
+        for (int c = 0; c < C; ++c) dst[c] = te[c] + pe[c];
+    } else {  // dtype 2: int8 row-major, per-row scale
+        const int8_t* te = wte.qdata.data() + static_cast<size_t>(id) * C;
+        float sc = wte.scale[id];
+        for (int c = 0; c < C; ++c) dst[c] = static_cast<float>(te[c]) * sc + pe[c];
+    }
+}
+
+// logits(V) = x(C) @ wte^T (weights tied). fp32 -> BLAS; int8 -> WEIGHT-ONLY int8
+// over the vocab rows. We keep the activation in fp32: the logits feed an argmax
+// over 50k classes and are precision-sensitive, and the activation is tiny anyway
+// (C floats), so quantizing it only adds error. The bandwidth win — the bottleneck
+// the roofline flagged — comes entirely from the int8 wte rows (154 -> 38 MB).
+inline void logits_from_hidden(const Tensor& wte, const float* x, int C, int V, float* out) {
+    if (wte.dtype == 0) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 1, V, C, 1.0f, x, C,
+                    wte.data.data(), C, 0.0f, out, V);
+        return;
+    }
+    const int8_t* q = wte.qdata.data();
+    const float* s = wte.scale.data();
+    const int CHUNK = 64;
+    const size_t nchunks = (V + CHUNK - 1) / CHUNK;
+    dispatch_apply(nchunks, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(size_t ch) {
+        int v0 = static_cast<int>(ch) * CHUNK;
+        int v1 = (v0 + CHUNK < V) ? v0 + CHUNK : V;
+        for (int v = v0; v < v1; ++v) {
+            const int8_t* wv = q + static_cast<size_t>(v) * C;
+            float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0),
+                        a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+            int c = 0;
+            for (; c + 16 <= C; c += 16) {
+                int8x16_t w8 = vld1q_s8(wv + c);
+                int16x8_t lo = vmovl_s8(vget_low_s8(w8));
+                int16x8_t hi = vmovl_s8(vget_high_s8(w8));
+                a0 = vfmaq_f32(a0, vld1q_f32(x + c),      vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))));
+                a1 = vfmaq_f32(a1, vld1q_f32(x + c + 4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))));
+                a2 = vfmaq_f32(a2, vld1q_f32(x + c + 8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))));
+                a3 = vfmaq_f32(a3, vld1q_f32(x + c + 12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))));
+            }
+            float acc = vaddvq_f32(a0) + vaddvq_f32(a1) + vaddvq_f32(a2) + vaddvq_f32(a3);
+            for (; c < C; ++c) acc += x[c] * static_cast<float>(wv[c]);
+            out[v] = acc * s[v];
+        }
+    });
+}
+
 // Full forward pass. Returns the logits (size vocab) for the LAST position only —
 // that's all generation needs, and it skips the big vocab projection on the rest.
 inline std::vector<float> forward_last_logits(const Model& m, const std::vector<int>& ids) {
@@ -226,11 +279,7 @@ inline std::vector<float> forward_last_logits(const Model& m, const std::vector<
     const Tensor& wpe = m.get("wpe.weight");  // (n_ctx, C)
 
     std::vector<float> x((size_t)T * C);
-    for (int t = 0; t < T; ++t) {
-        const float* te = wte.data.data() + (size_t)ids[t] * C;
-        const float* pe = wpe.data.data() + (size_t)t * C;
-        for (int i = 0; i < C; ++i) x[(size_t)t * C + i] = te[i] + pe[i];
-    }
+    for (int t = 0; t < T; ++t) embed_token(wte, wpe, ids[t], t, C, x.data() + (size_t)t * C);
 
     std::vector<float> ln, att, ff;
     for (int l = 0; l < m.cfg.n_layer; ++l) {
@@ -248,7 +297,6 @@ inline std::vector<float> forward_last_logits(const Model& m, const std::vector<
     // logits(1 x V) = last_hidden(1 x C) @ wte^T
     const float* last = ln.data() + (size_t)(T - 1) * C;
     std::vector<float> logits(V);
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 1, V, C, 1.0f, last, C, wte.data.data(), C,
-                0.0f, logits.data(), V);
+    logits_from_hidden(wte, last, C, V, logits.data());
     return logits;
 }

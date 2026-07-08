@@ -38,11 +38,8 @@ inline std::vector<float> forward_step(const Model& m, const std::vector<int>& n
 
     // Embed the new tokens at their absolute positions.
     std::vector<float> x((size_t)M * C);
-    for (int i = 0; i < M; ++i) {
-        const float* te = wte.data.data() + (size_t)new_ids[i] * C;
-        const float* pe = wpe.data.data() + (size_t)(pos0 + i) * C;
-        for (int c = 0; c < C; ++c) x[(size_t)i * C + c] = te[c] + pe[c];
-    }
+    for (int i = 0; i < M; ++i)
+        embed_token(wte, wpe, new_ids[i], pos0 + i, C, x.data() + (size_t)i * C);
 
     std::vector<float> ln, qkv, q((size_t)M * C), attn_out((size_t)M * C),
         scores((size_t)M * Lnew), proj, ff;
@@ -104,7 +101,6 @@ inline std::vector<float> forward_step(const Model& m, const std::vector<int>& n
     layernorm(x.data(), m.get("ln_f.weight"), m.get("ln_f.bias"), M, C, ln);
     const float* last = ln.data() + (size_t)(M - 1) * C;
     std::vector<float> logits(V);
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 1, V, C, 1.0f, last, C, wte.data.data(), C,
-                0.0f, logits.data(), V);
+    logits_from_hidden(wte, last, C, V, logits.data());
     return logits;
 }

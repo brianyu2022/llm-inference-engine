@@ -28,11 +28,8 @@ inline void batch_decode_step(const Model& m, const std::vector<int>& toks,
 
     // Embed the B tokens (each at its own position) -> x (B, C).
     std::vector<float> x(static_cast<size_t>(B) * C);
-    for (int b = 0; b < B; ++b) {
-        const float* te = wte.data.data() + static_cast<size_t>(toks[b]) * C;
-        const float* pe = wpe.data.data() + static_cast<size_t>(pos[b]) * C;
-        for (int c = 0; c < C; ++c) x[static_cast<size_t>(b) * C + c] = te[c] + pe[c];
-    }
+    for (int b = 0; b < B; ++b)
+        embed_token(wte, wpe, toks[b], pos[b], C, x.data() + static_cast<size_t>(b) * C);
 
     std::vector<float> ln, qkv, attn(static_cast<size_t>(B) * C), proj, ff, sc;
 
@@ -96,8 +93,7 @@ inline void batch_decode_step(const Model& m, const std::vector<int>& toks,
     std::vector<float> logits(V);
     for (int b = 0; b < B; ++b) {
         const float* xb = ln.data() + static_cast<size_t>(b) * C;
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 1, V, C, 1.0f, xb, C, wte.data.data(), C,
-                    0.0f, logits.data(), V);
+        logits_from_hidden(wte, xb, C, V, logits.data());
         int best = 0;
         float bv = logits[0];
         for (int i = 1; i < V; ++i)

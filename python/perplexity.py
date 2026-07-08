@@ -11,7 +11,7 @@ import numpy as np
 import model as model_module
 import tokenizer
 from model import GPT2
-from quantize import fake_quantize_model, quantize_int8, should_quantize
+from quantize import fake_quantize_model, fake_quantize_wte, quantize_int8, should_quantize
 
 
 def w8a8_linear(x, weight, bias):
@@ -73,6 +73,15 @@ def main() -> None:
     finally:
         model_module.linear = orig_linear
 
+    # W8A8 + int8 wte: also quantize the tied embedding/logits table (per-row).
+    m_full = GPT2()
+    m_full.w["wte.weight"] = fake_quantize_wte(m_full.w["wte.weight"])
+    model_module.linear = w8a8_linear
+    try:
+        ppl_full = perplexity(m_full, ids)
+    finally:
+        model_module.linear = orig_linear
+
     # Size accounting for just the tensors we quantize.
     fp32_bytes = int8_bytes = 0
     model = GPT2()
@@ -86,10 +95,11 @@ def main() -> None:
         return f"{p:.4f}  ({100 * (p - ppl_fp32) / ppl_fp32:+.2f}%)"
 
     print(f"passage: {len(ids)} tokens\n")
-    print(f"perplexity fp32        : {ppl_fp32:.4f}")
-    print(f"perplexity int8 (W8)   : {cost(ppl_w8)}     weight-only")
-    print(f"perplexity int8 (W8A8) : {cost(ppl_w8a8)}     weights + activations\n")
-    print(f"quantized weights: {fp32_bytes / 1e6:.0f} MB fp32 -> {int8_bytes / 1e6:.0f} MB int8 "
+    print(f"perplexity fp32           : {ppl_fp32:.4f}")
+    print(f"perplexity int8 (W8)      : {cost(ppl_w8)}     weight-only")
+    print(f"perplexity int8 (W8A8)    : {cost(ppl_w8a8)}     weights + activations")
+    print(f"perplexity int8 (W8A8+wte): {cost(ppl_full)}     + int8 embedding/logits table\n")
+    print(f"quantized linear weights: {fp32_bytes / 1e6:.0f} MB fp32 -> {int8_bytes / 1e6:.0f} MB int8 "
           f"({fp32_bytes / int8_bytes:.1f}x smaller)")
 
 

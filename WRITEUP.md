@@ -121,6 +121,18 @@ Decode sits far below the M4 Pro's FLOP:byte knee → **memory-bound**, which is
 logits projection (`wte`, 154 MB/token) dominates int8's traffic — so quantizing
 the embedding table is the clear next win.
 
+### Acting on the roofline: quantizing `wte`
+
+So I did it — per-row int8 for the tied embedding/logits table. One catch found by
+measurement: quantizing the *activation* into the logits (W8A8) wrecked output
+quality, because the logits feed an argmax over 50k classes and are
+precision-sensitive. Keeping the activation fp32 (weight-only int8) fixed it. The
+result: the model **nearly halved (232 → 121 MB)** at **+0.01% perplexity**, with
+a **modest ~5% decode gain**. Less than a pure-bandwidth model predicts — because,
+same as the linears, the int8 logits kernel runs on NEON while fp32 BLAS taps AMX.
+The roofline pointed the right direction; the payoff showed up mostly as size, and
+the speed ceiling is again AMX.
+
 ## Stage 5 — Continuous batching
 
 A scheduler keeps up to *B* sequences in flight and admits/prefills waiting
@@ -156,8 +168,8 @@ quantization matters more as you scale up.
 
 ## What I'd do next
 
-- **Quantize the `wte` logits projection** — the roofline says it's the biggest
-  remaining chunk of int8's memory traffic.
+- **A hand-written AMX / Metal matmul** — the recurring speed ceiling above is
+  Apple's AMX coprocessor; matching it (or moving to the GPU) is the next frontier.
 - **PagedAttention** — batch attention across sequences to make batching scale
   closer to linearly.
 - **A Metal GPU backend** for the matmuls.

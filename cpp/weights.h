@@ -12,10 +12,10 @@
 
 struct Tensor {
     std::vector<int> shape;        // logical shape (K, N) for weight matrices
-    int dtype = 0;                 // 0 = fp32, 1 = int8 (per-column, stored transposed (N, K))
-    std::vector<float> data;       // fp32 values         (dtype 0)
-    std::vector<int8_t> qdata;     // int8 values, (N, K) (dtype 1)
-    std::vector<float> scale;      // per-column scales, length N (dtype 1)
+    int dtype = 0;                 // 0 = fp32; 1 = int8 transposed (N,K) per-column; 2 = int8 row-major (R,C) per-row
+    std::vector<float> data;       // fp32 values                    (dtype 0)
+    std::vector<int8_t> qdata;     // int8 values: (N,K) dtype 1, (R,C) dtype 2
+    std::vector<float> scale;      // per-column (dtype 1) or per-row (dtype 2) scales
 
     size_t numel() const {
         size_t n = 1;
@@ -82,14 +82,14 @@ inline Model load_model(const std::string& path) {
             t.data.resize(t.numel());
             f.read(reinterpret_cast<char*>(t.data.data()),
                    static_cast<std::streamsize>(t.numel() * sizeof(float)));
-        } else {  // int8: N*K int8 values (transposed) followed by N fp32 scales
-            int K = t.rows(), N = t.cols();
-            t.qdata.resize(static_cast<size_t>(N) * K);
+        } else {  // int8: numel int8 values, then scales (per-column for dtype 1, per-row for dtype 2)
+            t.qdata.resize(t.numel());
             f.read(reinterpret_cast<char*>(t.qdata.data()),
                    static_cast<std::streamsize>(t.qdata.size()));
-            t.scale.resize(N);
+            int n_scale = (t.dtype == 1) ? t.shape[1] : t.shape[0];  // cols vs rows
+            t.scale.resize(n_scale);
             f.read(reinterpret_cast<char*>(t.scale.data()),
-                   static_cast<std::streamsize>(N * sizeof(float)));
+                   static_cast<std::streamsize>(n_scale * sizeof(float)));
         }
         if (!f) throw std::runtime_error("EOF while reading tensor " + name);
 

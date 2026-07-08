@@ -39,6 +39,21 @@ def dequantize_int8(q: np.ndarray, scale: np.ndarray) -> np.ndarray:
     return q.astype(np.float32) * scale  # broadcast over the N columns
 
 
+def quantize_int8_rows(W: np.ndarray):
+    """W (R, C) fp32 -> (q int8 (R, C), scale fp32 (R,)), per-ROW symmetric.
+    Used for the tied embedding table `wte`: each row is one vocab vector, read
+    contiguously both for embedding lookup and for the logits dot product."""
+    maxabs = np.max(np.abs(W), axis=1, keepdims=True)  # (R, 1)
+    scale = np.where(maxabs > 0, maxabs / 127.0, 1.0).astype(np.float32)
+    q = np.clip(np.round(W / scale), -127, 127).astype(np.int8)
+    return q, scale.reshape(-1)
+
+
+def fake_quantize_wte(W: np.ndarray) -> np.ndarray:
+    q, s = quantize_int8_rows(W)
+    return q.astype(np.float32) * s[:, None]
+
+
 def fake_quantize_model(weights: dict) -> dict:
     """Copy of the weights with the big linears round-tripped through int8.
     Used to measure the quality impact in the fp32 NumPy reference."""

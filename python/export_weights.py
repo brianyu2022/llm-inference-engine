@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 from safetensors.numpy import load_file
 
-from quantize import quantize_int8, should_quantize
+from quantize import quantize_int8, quantize_int8_rows, should_quantize
 
 WEIGHTS = Path(__file__).resolve().parent.parent / "weights"
 MASK_BUFFER = re.compile(r"h\.\d+\.attn\.bias$")
@@ -39,13 +39,16 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="gpt2", help="gpt2 | gpt2-medium | gpt2-large | gpt2-xl")
     ap.add_argument("--int8", action="store_true", help="quantize the big linear weights to int8")
+    ap.add_argument("--quant-wte", action="store_true",
+                    help="also quantize the tied embedding/logits table wte (needs --int8)")
     args = ap.parse_args()
 
     src = WEIGHTS if args.model == "gpt2" else WEIGHTS / args.model
     cfg = json.loads((src / "config.json").read_text())
     tensors = load_file(str(src / "model.safetensors"))
     keep = {k: v for k, v in tensors.items() if not MASK_BUFFER.search(k)}
-    out_path = WEIGHTS / f"{args.model}{'-int8' if args.int8 else ''}.bin"
+    suffix = "-int8" + ("w" if args.quant_wte else "") if args.int8 else ""
+    out_path = WEIGHTS / f"{args.model}{suffix}.bin"
 
     n_quant = 0
     with open(out_path, "wb") as f:
@@ -63,11 +66,20 @@ def main() -> None:
             if args.int8 and should_quantize(name, arr):
                 q, scale = quantize_int8(np.ascontiguousarray(arr, dtype=np.float32))  # q (K,N), scale (N,)
                 q_t = np.ascontiguousarray(q.T)  # (N, K): each output column contiguous
-                f.write(struct.pack("<i", 1))    # dtype int8
+                f.write(struct.pack("<i", 1))    # dtype int8, transposed, per-column scale
                 f.write(struct.pack("<i", arr.ndim))
                 for d in arr.shape:              # logical (K, N)
                     f.write(struct.pack("<i", int(d)))
                 f.write(q_t.tobytes())
+                f.write(np.ascontiguousarray(scale, dtype="<f4").tobytes())
+                n_quant += 1
+            elif args.int8 and args.quant_wte and name == "wte.weight":
+                q, scale = quantize_int8_rows(np.ascontiguousarray(arr, dtype=np.float32))  # q (V,C), scale (V,)
+                f.write(struct.pack("<i", 2))    # dtype int8, row-major, per-row scale
+                f.write(struct.pack("<i", arr.ndim))
+                for d in arr.shape:              # (V, C)
+                    f.write(struct.pack("<i", int(d)))
+                f.write(np.ascontiguousarray(q).tobytes())
                 f.write(np.ascontiguousarray(scale, dtype="<f4").tobytes())
                 n_quant += 1
             else:
