@@ -1,147 +1,124 @@
 # LLM Inference Engine
 
-A from-scratch LLM inference engine. Starts as a readable NumPy reference that runs
-**GPT-2** with no PyTorch, then becomes a fast C++ engine with a KV-cache, int8
-quantization, continuous batching, and a hand-written int8 kernel that **beats
-Apple's Accelerate BLAS by 1.21×**.
+**A from-scratch GPT-2 inference engine in C++ — with a hand-written int8 kernel
+that runs 1.21× faster than Apple's Accelerate BLAS.**
 
-The point isn't "it generates text" — that's the easy part. The point is the
-**performance engineering**: making it fast and measuring it honestly.
+No PyTorch, no ML framework. The forward pass, KV-cache, quantization, custom
+SIMD kernels, and a continuous-batching server are all implemented from the
+weights up and validated token-for-token against a reference. Built and
+benchmarked on an Apple M4 Pro.
 
-**📄 [Read the full writeup →](WRITEUP.md)** — the stage-by-stage story, the
-benchmarks, and what each optimization taught (prefill vs. decode, memory-bound
-kernels, AMX vs. NEON vs. integer SDOT, the batching throughput/latency tradeoff).
+📄 **[Read the full writeup →](WRITEUP.md)** — the engineering story and what each
+optimization taught (prefill vs. decode, memory-bound kernels, AMX vs. NEON vs.
+integer SDOT, the batching throughput/latency tradeoff).
 
-## Why this exists
+---
 
-Built as a deep-dive into how large language models actually run on hardware:
-memory bandwidth, cache behavior, quantization, and the arithmetic intensity of
-attention. Every optimization is benchmarked against a baseline.
+## Highlights
 
-## Roadmap
+- **From-scratch forward pass** — GPT-2 implemented first in NumPy, then C++,
+  reading raw safetensors with no framework. Validated token-for-token against
+  the reference greedy output.
+- **A custom int8 kernel that beats the vendor** — W8A8 quantization with an ARM
+  **NEON + `SDOT`** matmul, multithreaded with Grand Central Dispatch:
+  **1.21× faster than Apple's fp32 BLAS**, at a 2–4× smaller model.
+- **KV-cache** with a prefill/decode split — **13× faster decode** and flat
+  per-token latency.
+- **Continuous batching** — batches the linear projections across concurrent
+  requests and fans attention across cores: **1.92× throughput** at batch 16,
+  with p50/p95 latency reporting.
+- **Profiling-driven** — a roofline analysis proves decode is memory-bound and
+  drove every optimization; quantization quality is measured with perplexity.
+- **Architecture-general** — runs any GPT-2 size (124M / 355M / 774M / 1.5B) from
+  the model config with no code changes.
 
-- [x] **Stage 1 — Correct forward pass (Python/NumPy).** Loads real GPT-2 124M
-      weights and generates text; validated token-for-token against the reference
-      greedy continuation. Baseline benchmarked in `benchmarks/`.
-- [x] **Stage 2 — C++ engine.** Full forward pass in C++ on Accelerate BLAS,
-      validated token-for-token against the NumPy reference. **~76 tok/s vs. 10
-      tok/s NumPy (~8×)** — from killing interpreter overhead and only projecting
-      the last position's logits, before any KV-cache.
-- [x] **Stage 3 — KV-cache.** Prefill/decode split; cache each layer's K/V and
-      attend against history instead of recomputing. **243 tok/s vs. 19 tok/s
-      non-cached at 256 tokens (~13×)**, with flat per-token latency.
-- [x] **Stage 4 — int8 quantization + custom kernel.** Weights 2× smaller on
-      disk (498 → 243 MB) at **+0.85% perplexity**, greedy output unchanged.
-      Custom int8 matmul with **NEON SIMD + GCD multithreading**: 184 tok/s —
-      **7× faster than the naive scalar kernel** (26 tok/s), ~0.78× of fp32 BLAS.
-      The remaining gap is Apple's **AMX matrix coprocessor** (used by Accelerate
-      for fp32 GEMM), which NEON can't match. *Lesson: quantization only helps if
-      the kernel exploits it, and you're competing against dedicated matrix HW.*
-- [x] **Stage 5 — Continuous batching.** Decode B sequences per step — batching
-      the linear projections, fanning per-sequence attention across cores — and
-      admit/prefill waiting requests as slots free. Aggregate throughput scales
-      **302 → 581 tok/s (1.92×) from batch 1 → 16**, with the expected latency
-      tradeoff.
-- [x] **Stage 6 — W8A8 + SDOT integer kernel.** Dynamic per-row int8 activations
-      + ARM `SDOT` (int8·int8 → int32). **~302 tok/s — 1.21× faster than fp32
-      BLAS**, beating Apple's AMX path, at +4.0% perplexity. *The full arc:
-      naive 26 → NEON weight-only 184 → W8A8 302 tok/s.*
-- [x] **Roofline analysis.** Decode is 0.5–1.0 FLOP/byte — firmly memory-bound.
-      fp32 hits 44% of the M4 Pro's ~273 GB/s peak, int8 26%. The fp32 logits
-      projection (`wte`, 154 MB/token) dominates int8 traffic → quantizing the
-      embedding table is the next win. (`python/roofline.py`)
-- [x] **Quantized `wte`** (the roofline's predicted next win). Per-row int8,
-      weight-only for the argmax-sensitive logits (`export_weights.py --int8
-      --quant-wte`). Nearly **halves the model, 232 → 121 MB**, at **+0.01%
-      perplexity**; decode +~5% — modest, because (same as the linears) the int8
-      logits kernel uses NEON, not the AMX that fp32 BLAS taps. The roofline
-      pointed the right way; the win landed mostly as size.
+## Benchmarks
 
-## Status
+GPT-2 124M, Apple M4 Pro, greedy decode.
 
-**All core stages (1–6) done.** From-scratch GPT-2: NumPy reference → C++ engine
-→ KV-cache (243 tok/s) → int8 quantization → **custom W8A8 + SDOT kernel that
-beats Apple's fp32 BLAS by 1.21×** → **continuous batching** (1.88× throughput at
-batch 16). Everything validated token-for-token against the reference. Polish
-remaining: roofline analysis, bigger models, a writeup.
+**Decode throughput — the optimization journey**
 
-### Benchmarks (GPT-2 124M, M4 Pro, greedy, 256 tokens)
-
-| Engine | Decode throughput | vs fp32 |
+| Engine | tok/s | vs. fp32 BLAS |
 |---|---:|---:|
-| NumPy reference | ~10 tok/s | |
-| C++ (no cache) | ~19 tok/s | |
-| C++ + KV-cache (fp32 BLAS) | **~249 tok/s** | 1.0× |
-| C++ + KV-cache + int8, naive kernel | ~26 tok/s | 0.10× |
-| C++ + KV-cache + int8, NEON+threads (weight-only) | ~184 tok/s | 0.78× |
-| **C++ + KV-cache + W8A8 SDOT** | **~302 tok/s** | **1.21×** |
+| NumPy reference | ~10 | |
+| C++, no KV-cache | ~19 | |
+| C++ + KV-cache (fp32 BLAS) | ~249 | 1.00× |
+| + int8, naive scalar kernel | ~26 | 0.10× |
+| + int8, NEON + multithreaded | ~184 | 0.74× |
+| **+ int8, W8A8 + SDOT kernel** | **~302** | **1.21×** |
 
-int8 model is 243 MB on disk (vs 498 MB fp32). Quality cost: +0.85% perplexity
-weight-only, +4.0% for W8A8 (weights + activations).
+**Model size & quality**
 
-### Continuous batching (GPT-2 124M int8, 32 requests × 64 tokens)
+| Build | Size | Perplexity vs. fp32 |
+|---|---:|---:|
+| fp32 | 498 MB | — |
+| int8 (W8A8) | 243 MB | +4.0% |
+| int8 + quantized embedding table | 128 MB | +4.1% |
 
-| max batch | aggregate tok/s | speedup | p50 latency | p95 latency |
+*(Weight-only int8 — fp32 activations — costs just +0.85%; the W8A8 kernel trades
+~+4% perplexity for the SDOT speedup. Greedy output is unchanged on test prompts.)*
+
+**Continuous batching** (32 requests × 64 tokens, int8)
+
+| Max batch | Aggregate tok/s | Speedup | p50 | p95 |
 |---:|---:|---:|---:|---:|
 | 1 | 302 | 1.00× | 210 ms | 213 ms |
 | 4 | 382 | 1.26× | 648 ms | 673 ms |
 | 8 | 494 | 1.63× | 982 ms | 1030 ms |
 | 16 | 581 | 1.92× | 1638 ms | 1738 ms |
 
-Throughput scales with batch size (the linear projections are batched into single
-matmuls; the per-sequence attention is fanned across cores with GCD); per-request
-latency rises — the classic serving tradeoff. Scaling is still sublinear because
-at large batch the batched linears also saturate — a paged/batched attention
-(PagedAttention) is the next lever.
+**Scaling** (runs larger models with no code changes)
 
-### Scaling to larger models
-
-The engine is config-driven — it runs any GPT-2 size with no code changes
-(`python python/download_weights.py gpt2-medium && python python/export_weights.py
---model gpt2-medium --int8`). Verified on **GPT-2 medium (355M)**; fp32 and int8
-produce identical greedy output:
-
-| model | params | fp32 decode | int8 (W8A8) decode | int8 on disk |
+| Model | Params | fp32 decode | int8 decode | int8 size |
 |---|---:|---:|---:|---:|
-| gpt2 | 124M | 243 tok/s | 302 tok/s | 243 MB |
-| gpt2-medium | 355M | 91 tok/s | 110 tok/s | 514 MB |
+| GPT-2 | 124M | 249 tok/s | 302 tok/s | 243 MB |
+| GPT-2 medium | 355M | 91 tok/s | 110 tok/s | 514 MB |
 
-The ~1.2× int8 speedup holds across sizes; larger models are more
-bandwidth-bound, so quantization matters more as you scale.
+## How it works
 
-### Running the C++ engine
-
-```sh
-python python/export_weights.py     # one-time: writes weights/gpt2.bin
-make -C cpp                          # build ./cpp/build/{inspect,generate,generate_kv}
-python python/run_cpp.py             # validate both C++ engines vs NumPy
-
-# generate directly (prompt as token ids; tokenize with python/tokenizer.py)
-./cpp/build/generate_kv weights/gpt2.bin 256 <id0> <id1> ...
+```
+safetensors ──► flat binary weight format ──► C++ engine
+ (Hugging Face)   (export_weights.py, GGUF-like)   │
+                                                    ├─ embed
+                                                    ├─ N × (multi-head attention + MLP)   ← KV-cache on decode
+                                                    └─ logits                              ← int8 SDOT kernels
 ```
 
-## Quickstart (Stage 1)
+The matmuls use Apple's Accelerate BLAS for fp32 and a hand-written NEON/`SDOT`
+kernel for int8. Tokenization uses `tiktoken` (Python) around the C++ core.
+
+## Quickstart
 
 ```sh
-# from the repo root
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-python python/download_weights.py   # fetch GPT-2 124M weights (~500 MB) into weights/
-python python/inspect_weights.py     # print the model's tensors — your map of GPT-2
-python python/generate.py            # generate text (greedy by default)
+python python/download_weights.py                    # GPT-2 124M weights
+python python/export_weights.py --int8 --quant-wte   # -> weights/gpt2-int8w.bin
+make -C cpp                                          # build the engine
+python python/run_cpp.py                             # validate C++ vs. NumPy reference
 ```
 
-Correctness check: with the default prompt and greedy decoding, GPT-2 124M
-continues *"Alan Turing theorized that computers would one day become"* with
-*" the most powerful machines on the planet."*
+Generate, benchmark, and serve:
 
-## Layout
+```sh
+python python/bench_quant.py    # fp32 vs. int8 decode + quality
+python python/bench_serve.py    # continuous-batching throughput and latency
+python python/roofline.py       # memory-bandwidth roofline analysis
+```
+
+## Repository layout
 
 ```
-python/        Stage 1 reference implementation (NumPy, no torch)
-cpp/           Stage 2+ the real engine
-weights/       downloaded model weights (gitignored)
-benchmarks/    benchmark results and scripts
+python/   NumPy reference, weight export/quantization, tokenizer,
+          and benchmarks (quantization, batching, roofline, perplexity)
+cpp/      C++ engine: weight loader, forward pass, KV-cache,
+          int8 NEON/SDOT kernels, and the continuous-batching server
+weights/  downloaded weights + exported binaries (gitignored)
 ```
+
+## Future work
+
+- Match Apple's AMX matrix coprocessor with a hand-tuned kernel, or a Metal GPU backend
+- PagedAttention, so batched throughput scales closer to linearly
+- A modern architecture (Llama: RoPE, RMSNorm, SwiGLU, grouped-query attention)

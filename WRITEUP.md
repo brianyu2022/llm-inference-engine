@@ -3,7 +3,7 @@
 A from-scratch GPT-2 inference engine — no PyTorch, no ML framework — that ends up
 **beating Apple's own optimized BLAS** with a hand-written int8 kernel, and serves
 concurrent requests with continuous batching. This is the story of how it was
-built, stage by stage, and what each stage taught.
+built and what each optimization taught.
 
 Everything is benchmarked on an **Apple M4 Pro**, GPT-2 124M, greedy decoding.
 
@@ -35,7 +35,7 @@ Plus continuous batching for **1.88× aggregate throughput** at batch 16.
 
 ---
 
-## Stage 1 — A correct forward pass (NumPy)
+## A correct forward pass (NumPy)
 
 I implemented GPT-2's forward pass in pure NumPy: tokenizer, embeddings,
 multi-head causal attention, the tanh-GELU MLP, LayerNorm, and weight-tied
@@ -53,7 +53,7 @@ wrong is the classic from-scratch bug.
 
 Baseline: **~10 tok/s**, and it got *slower* with sequence length.
 
-## Stage 2 — A C++ engine
+## A C++ engine
 
 Ported the forward pass to C++ on Apple's Accelerate BLAS (`cblas_sgemm`). To make
 loading trivial I designed a small flat binary weight format (the same idea as
@@ -64,7 +64,7 @@ reference. The insight: at decode the bottleneck wasn't the matmuls (BLAS does
 those in both), it was **Python interpreter overhead** and wastefully projecting
 *every* position to the 50k vocab instead of just the last one.
 
-## Stage 3 — KV-cache
+## KV-cache
 
 To generate token *N*, the naive engine reprocesses all *N* tokens, recomputing
 keys/values it already computed. The KV-cache stores each layer's K/V; each step
@@ -80,7 +80,7 @@ and it's algorithmic — no BLAS trick gives it to you.
 matmul), decode is *memory-bound* (stream all the weights to make one token).
 They are different problems.
 
-## Stage 4 — int8 quantization
+## int8 quantization
 
 Quantized the big linear weights to int8 (per-output-column symmetric). Measured
 the quality cost properly with **perplexity**: **+0.85%** weight-only. Model
@@ -90,7 +90,7 @@ But the naive int8 kernel was **10× *slower*** than fp32 BLAS. Why? It read 4×
 data but ran single-threaded and unvectorized, while Accelerate uses all cores and
 SIMD. **Reading less data doesn't help if you can't keep the machine busy.**
 
-## Stage 6 — A custom kernel that beats BLAS
+## A custom kernel that beats BLAS
 
 Two steps to fix it:
 1. **NEON SIMD + multithreading** (GCD `dispatch_apply`): 26 → 184 tok/s (7×), but
@@ -133,7 +133,7 @@ same as the linears, the int8 logits kernel runs on NEON while fp32 BLAS taps AM
 The roofline pointed the right direction; the payoff showed up mostly as size, and
 the speed ceiling is again AMX.
 
-## Stage 5 — Continuous batching
+## Continuous batching
 
 A scheduler keeps up to *B* sequences in flight and admits/prefills waiting
 requests as slots free. The trick: **batch the linear projections across
