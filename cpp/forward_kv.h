@@ -31,6 +31,8 @@ inline std::vector<float> forward_step(const Model& m, const std::vector<int>& n
     int C = m.cfg.n_embd, H = m.cfg.n_head, hd = C / H, V = m.cfg.vocab_size;
     int pos0 = cache.len;        // global position of the first new token
     int Lnew = pos0 + M;         // total cached length after this step
+    if (Lnew > cache.n_ctx)
+        throw std::runtime_error("sequence length exceeds context window (n_ctx)");
     const Tensor& wte = m.get("wte.weight");
     const Tensor& wpe = m.get("wpe.weight");
 

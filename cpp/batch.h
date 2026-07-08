@@ -20,7 +20,11 @@ inline void batch_decode_step(const Model& m, const std::vector<int>& toks,
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
     std::vector<int> pos(B);
-    for (int b = 0; b < B; ++b) pos[b] = caches[b]->len;  // this token's position, per sequence
+    for (int b = 0; b < B; ++b) {
+        pos[b] = caches[b]->len;  // this token's position, per sequence
+        if (pos[b] + 1 > caches[b]->n_ctx)
+            throw std::runtime_error("sequence length exceeds context window (n_ctx)");
+    }
 
     // Embed the B tokens (each at its own position) -> x (B, C).
     std::vector<float> x(static_cast<size_t>(B) * C);
