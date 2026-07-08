@@ -142,13 +142,14 @@ against each one's cache.
 
 | max batch | aggregate tok/s | speedup | p50 | p95 |
 |---:|---:|---:|---:|---:|
-| 1 | 272 | 1.00× | 234 ms | 236 ms |
-| 8 | 437 | 1.61× | 1114 ms | 1167 ms |
-| 16 | 511 | 1.88× | 1862 ms | 1979 ms |
+| 1 | 302 | 1.00× | 210 ms | 213 ms |
+| 8 | 494 | 1.63× | 982 ms | 1030 ms |
+| 16 | 581 | 1.92× | 1638 ms | 1738 ms |
 
 Throughput scales with batch; per-request latency rises — the classic serving
-tradeoff. Scaling is sublinear because attention is still per-sequence, which is
-exactly what PagedAttention/FlashAttention address.
+tradeoff. The per-sequence attention is fanned across cores with GCD (a ~14% peak
+bump); scaling is still sublinear because at large batch the batched linears
+saturate too — which is what PagedAttention/FlashAttention address.
 
 ---
 

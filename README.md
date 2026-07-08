@@ -38,9 +38,10 @@ attention. Every optimization is benchmarked against a baseline.
       for fp32 GEMM), which NEON can't match. *Lesson: quantization only helps if
       the kernel exploits it, and you're competing against dedicated matrix HW.*
 - [x] **Stage 5 — Continuous batching.** Decode B sequences per step — batching
-      the linear projections while attending per-sequence — and admit/prefill
-      waiting requests as slots free. Aggregate throughput scales **272 → 511
-      tok/s (1.88×) from batch 1 → 16**, with the expected latency tradeoff.
+      the linear projections, fanning per-sequence attention across cores — and
+      admit/prefill waiting requests as slots free. Aggregate throughput scales
+      **302 → 581 tok/s (1.92×) from batch 1 → 16**, with the expected latency
+      tradeoff.
 - [x] **Stage 6 — W8A8 + SDOT integer kernel.** Dynamic per-row int8 activations
       + ARM `SDOT` (int8·int8 → int32). **~302 tok/s — 1.21× faster than fp32
       BLAS**, beating Apple's AMX path, at +4.0% perplexity. *The full arc:
@@ -82,14 +83,16 @@ weight-only, +4.0% for W8A8 (weights + activations).
 
 | max batch | aggregate tok/s | speedup | p50 latency | p95 latency |
 |---:|---:|---:|---:|---:|
-| 1 | 272 | 1.00× | 234 ms | 236 ms |
-| 4 | 353 | 1.30× | 699 ms | 723 ms |
-| 8 | 437 | 1.61× | 1114 ms | 1167 ms |
-| 16 | 511 | 1.88× | 1862 ms | 1979 ms |
+| 1 | 302 | 1.00× | 210 ms | 213 ms |
+| 4 | 382 | 1.26× | 648 ms | 673 ms |
+| 8 | 494 | 1.63× | 982 ms | 1030 ms |
+| 16 | 581 | 1.92× | 1638 ms | 1738 ms |
 
-Throughput scales with batch size (the linear projections are batched across
-sequences); per-request latency rises — the classic serving tradeoff. Scaling is
-sublinear because attention is still per-sequence (what PagedAttention fixes).
+Throughput scales with batch size (the linear projections are batched into single
+matmuls; the per-sequence attention is fanned across cores with GCD); per-request
+latency rises — the classic serving tradeoff. Scaling is still sublinear because
+at large batch the batched linears also saturate — a paged/batched attention
+(PagedAttention) is the next lever.
 
 ### Scaling to larger models
 
