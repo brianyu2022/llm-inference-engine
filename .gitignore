@@ -1,0 +1,20 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# model weights — large, downloaded on demand
+weights/
+
+# c++ build artifacts
+cpp/build/
+*.o
+*.out
+*.dSYM/
+
+# benchmark scratch
+benchmarks/*.tmp
+
+# macOS
+.DS_Store

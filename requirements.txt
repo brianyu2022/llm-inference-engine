@@ -1,0 +1,6 @@
+# Stage 1 (Python/NumPy reference) dependencies. No torch — we read the raw
+# safetensors with numpy so the forward pass is genuinely from scratch.
+numpy>=1.26
+safetensors>=0.4
+huggingface_hub>=0.24
+tiktoken>=0.7
