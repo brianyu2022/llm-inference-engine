@@ -41,7 +41,11 @@ attention. Every optimization is benchmarked against a baseline.
 - [x] **Stage 6 — W8A8 + SDOT integer kernel.** Dynamic per-row int8 activations
       + ARM `SDOT` (int8·int8 → int32). **~302 tok/s — 1.21× faster than fp32
       BLAS**, beating Apple's AMX path, at +4.0% perplexity. *The full arc:
-      naive 26 → NEON weight-only 184 → W8A8 302 tok/s.* (Roofline analysis TODO.)
+      naive 26 → NEON weight-only 184 → W8A8 302 tok/s.*
+- [x] **Roofline analysis.** Decode is 0.5–1.0 FLOP/byte — firmly memory-bound.
+      fp32 hits 44% of the M4 Pro's ~273 GB/s peak, int8 26%. The fp32 logits
+      projection (`wte`, 154 MB/token) dominates int8 traffic → quantizing the
+      embedding table is the next win. (`python/roofline.py`)
 
 ## Status
 
