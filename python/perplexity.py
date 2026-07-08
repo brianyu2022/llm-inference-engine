@@ -8,9 +8,23 @@ fixed passage, and report the model-size reduction too.
 
 import numpy as np
 
+import model as model_module
 import tokenizer
 from model import GPT2
 from quantize import fake_quantize_model, quantize_int8, should_quantize
+
+
+def w8a8_linear(x, weight, bias):
+    """Simulate the C++ W8A8 kernel: per-row int8 activations, per-column int8
+    weights, integer matmul, then dequantize. Used (via monkeypatch) to measure
+    the quality cost of quantizing activations too."""
+    x_absmax = np.max(np.abs(x), axis=1, keepdims=True)
+    x_scale = np.where(x_absmax > 0, x_absmax / 127.0, 1.0)
+    xq = np.clip(np.round(x / x_scale), -127, 127)
+    w_absmax = np.max(np.abs(weight), axis=0)
+    w_scale = np.where(w_absmax > 0, w_absmax / 127.0, 1.0)
+    wq = np.clip(np.round(weight / w_scale), -127, 127)
+    return (xq @ wq) * x_scale * w_scale + bias
 
 # A fixed passage to score (teacher-forced). ~200 tokens of ordinary English.
 TEXT = (
@@ -42,30 +56,41 @@ def perplexity(model: GPT2, ids: list[int]) -> float:
 
 def main() -> None:
     ids = tokenizer.encode(TEXT)
-    model = GPT2()
 
-    ppl_fp32 = perplexity(model, ids)
+    ppl_fp32 = perplexity(GPT2(), ids)
+
+    # W8: weight-only int8 (activations stay fp32).
+    m_w8 = GPT2()
+    m_w8.w = fake_quantize_model(m_w8.w)
+    ppl_w8 = perplexity(m_w8, ids)
+
+    # W8A8: also quantize activations, by monkeypatching the linear op.
+    m_w8a8 = GPT2()
+    orig_linear = model_module.linear
+    model_module.linear = w8a8_linear
+    try:
+        ppl_w8a8 = perplexity(m_w8a8, ids)
+    finally:
+        model_module.linear = orig_linear
 
     # Size accounting for just the tensors we quantize.
     fp32_bytes = int8_bytes = 0
+    model = GPT2()
     for name, arr in model.w.items():
         if should_quantize(name, arr):
             fp32_bytes += arr.nbytes
             q, s = quantize_int8(arr)
             int8_bytes += q.nbytes + s.nbytes
-    total_fp32 = sum(a.nbytes for a in model.w.values())
 
-    model.w = fake_quantize_model(model.w)
-    ppl_int8 = perplexity(model, ids)
+    def cost(p):
+        return f"{p:.4f}  ({100 * (p - ppl_fp32) / ppl_fp32:+.2f}%)"
 
     print(f"passage: {len(ids)} tokens\n")
-    print(f"perplexity fp32 : {ppl_fp32:.4f}")
-    print(f"perplexity int8 : {ppl_int8:.4f}")
-    print(f"quality cost    : {100 * (ppl_int8 - ppl_fp32) / ppl_fp32:+.2f}% perplexity\n")
+    print(f"perplexity fp32        : {ppl_fp32:.4f}")
+    print(f"perplexity int8 (W8)   : {cost(ppl_w8)}     weight-only")
+    print(f"perplexity int8 (W8A8) : {cost(ppl_w8a8)}     weights + activations\n")
     print(f"quantized weights: {fp32_bytes / 1e6:.0f} MB fp32 -> {int8_bytes / 1e6:.0f} MB int8 "
           f"({fp32_bytes / int8_bytes:.1f}x smaller)")
-    print(f"whole model      : {total_fp32 / 1e6:.0f} MB -> "
-          f"{(total_fp32 - fp32_bytes + int8_bytes) / 1e6:.0f} MB")
 
 
 if __name__ == "__main__":

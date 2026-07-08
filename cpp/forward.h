@@ -62,6 +62,57 @@ inline void qmatmul_int8(const float* X, const Tensor& W, int T, float* Y) {
     });
 }
 
+// W8A8 matmul using ARM's SDOT (int8·int8 -> int32). We dynamically quantize each
+// activation row to int8 (per-row scale), so the inner loop is a pure integer dot
+// product with NO float conversion — true int8 compute that can beat AMX-fp32 on
+// this bandwidth-bound workload. Dequant afterward: dot * x_scale * w_scale.
+inline void qmatmul_w8a8(const float* X, const Tensor& W, int T, float* Y) {
+    const int K = W.rows(), N = W.cols();
+    const int8_t* q = W.qdata.data();
+    const float* s = W.scale.data();
+
+    // Per-row dynamic activation quantization (reused across all output columns).
+    std::vector<int8_t> xq(static_cast<size_t>(T) * K);
+    std::vector<float> xscale(T);
+    for (int t = 0; t < T; ++t) {
+        const float* xrow = X + static_cast<size_t>(t) * K;
+        float amax = 0.0f;
+        for (int k = 0; k < K; ++k) { float a = std::fabs(xrow[k]); amax = a > amax ? a : amax; }
+        float sc = amax > 0.0f ? amax / 127.0f : 1.0f;
+        xscale[t] = sc;
+        float inv = 1.0f / sc;
+        int8_t* dst = xq.data() + static_cast<size_t>(t) * K;
+        for (int k = 0; k < K; ++k) {
+            long v = std::lround(xrow[k] * inv);
+            dst[k] = static_cast<int8_t>(v > 127 ? 127 : (v < -127 ? -127 : v));
+        }
+    }
+
+    const int CHUNK = 32;
+    const size_t nchunks = (N + CHUNK - 1) / CHUNK;
+    const int8_t* xqp = xq.data();
+    const float* xsp = xscale.data();
+    dispatch_apply(nchunks, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(size_t c) {
+        int n0 = static_cast<int>(c) * CHUNK;
+        int n1 = (n0 + CHUNK < N) ? n0 + CHUNK : N;
+        for (int t = 0; t < T; ++t) {
+            const int8_t* xr = xqp + static_cast<size_t>(t) * K;
+            float* yrow = Y + static_cast<size_t>(t) * N;
+            float xs = xsp[t];
+            for (int n = n0; n < n1; ++n) {
+                const int8_t* wq = q + static_cast<size_t>(n) * K;
+                int32x4_t acc = vdupq_n_s32(0);
+                int k = 0;
+                for (; k + 16 <= K; k += 16)
+                    acc = vdotq_s32(acc, vld1q_s8(xr + k), vld1q_s8(wq + k));
+                int32_t dot = vaddvq_s32(acc);
+                for (; k < K; ++k) dot += static_cast<int>(xr[k]) * static_cast<int>(wq[k]);
+                yrow[n] = static_cast<float>(dot) * xs * s[n];
+            }
+        }
+    });
+}
+
 // Y(T x N) = X(T x K) @ W(K x N) + bias(N). W is a GPT-2 Conv1D weight (in x out).
 // fp32 weights go through BLAS; int8 weights use a weight-only quantized kernel
 // that reads 1-byte weights and dequantizes on the fly (4x less memory traffic).
@@ -73,7 +124,7 @@ inline void linear(const float* X, const Tensor& W, const Tensor& bias, int T,
     if (W.dtype == 0) {
         gemm(X, W.data.data(), Y.data(), T, N, K, /*transB=*/false);
     } else {
-        qmatmul_int8(X, W, T, Y.data());
+        qmatmul_w8a8(X, W, T, Y.data());  // int8 weights + int8 activations, via SDOT
     }
 
     for (int t = 0; t < T; ++t)

@@ -36,24 +36,31 @@ attention. Every optimization is benchmarked against a baseline.
       the kernel exploits it, and you're competing against dedicated matrix HW.*
 - [ ] **Stage 5 — Continuous batching + serving API.** Metric: throughput and
       p50/p95 under concurrent load.
-- [ ] **Stage 6 — W8A8 + SDOT integer kernel.** Quantize activations too and use
-      ARM's int8 dot-product instruction to beat fp32 BLAS. Plus roofline
-      analysis.
+- [x] **Stage 6 — W8A8 + SDOT integer kernel.** Dynamic per-row int8 activations
+      + ARM `SDOT` (int8·int8 → int32). **~302 tok/s — 1.21× faster than fp32
+      BLAS**, beating Apple's AMX path, at +4.0% perplexity. *The full arc:
+      naive 26 → NEON weight-only 184 → W8A8 302 tok/s.* (Roofline analysis TODO.)
 
 ## Status
 
-**Stages 1–4 done.** fp32 KV-cache engine: **243 tok/s** decode (validated
-token-for-token). int8 path: 2× smaller on disk, +0.85% perplexity, with a
-NEON+multithreaded kernel at 184 tok/s (7× over naive). Next: W8A8 + SDOT to
-beat fp32 BLAS (Stage 6), or the serving API (Stage 5).
+**Stages 1–4 + 6 done.** The custom **W8A8 + SDOT int8 kernel does ~302 tok/s —
+1.21× faster than Apple's fp32 BLAS** — at a 2× smaller model and +4.0%
+perplexity, greedy output unchanged. Full engine validated token-for-token
+against the NumPy reference. Remaining: Stage 5 (serving API), roofline analysis.
 
 ### Benchmarks (GPT-2 124M, M4 Pro, greedy, 256 tokens)
 
-| Engine | Decode throughput |
-|---|---:|
-| NumPy reference | ~10 tok/s |
-| C++ (no cache) | ~19 tok/s |
-| C++ + KV-cache | **~243 tok/s** |
+| Engine | Decode throughput | vs fp32 |
+|---|---:|---:|
+| NumPy reference | ~10 tok/s | |
+| C++ (no cache) | ~19 tok/s | |
+| C++ + KV-cache (fp32 BLAS) | **~249 tok/s** | 1.0× |
+| C++ + KV-cache + int8, naive kernel | ~26 tok/s | 0.10× |
+| C++ + KV-cache + int8, NEON+threads (weight-only) | ~184 tok/s | 0.78× |
+| **C++ + KV-cache + W8A8 SDOT** | **~302 tok/s** | **1.21×** |
+
+int8 model is 243 MB on disk (vs 498 MB fp32). Quality cost: +0.85% perplexity
+weight-only, +4.0% for W8A8 (weights + activations).
 
 ### Running the C++ engine
 

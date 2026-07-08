@@ -4,7 +4,9 @@
 CXX      := clang++
 # ACCELERATE_NEW_LAPACK selects Apple's modern CBLAS headers (silences the
 # macOS 13.3 deprecation warning; we stay on 32-bit int indices, LP64).
-CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -DACCELERATE_NEW_LAPACK
+# -mcpu=apple-m1 enables the ARMv8.2 dot-product feature (SDOT / vdotq_s32) used
+# by the W8A8 int8 kernel; runs on M1 and every later Apple Silicon chip.
+CXXFLAGS := -std=c++17 -O3 -Wall -Wextra -DACCELERATE_NEW_LAPACK -mcpu=apple-m1
 LDFLAGS  := -framework Accelerate
 BUILD    := build
 
